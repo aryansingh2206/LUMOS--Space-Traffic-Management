@@ -1,49 +1,67 @@
-import fs from "fs";
-import path from "path";
+// server/routes/tracker-server.ts
 import { Server as SocketIOServer } from "socket.io";
+import type { Server as HttpServer } from "http";
+import { SatelliteModel } from "../models/Satellite";
 
-// Helper to read JSON safely
-function readArr(filePath: string) {
-  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, "[]");
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
-  } catch {
-    return [];
-  }
-}
-
-export function attachTrackerServer(httpServer: any) {
-  const io = new SocketIOServer(httpServer, { cors: { origin: "*" } });
+/**
+ * Attaches a Socket.IO tracker server that emits live satellite positions
+ * every second to connected clients.
+ */
+export function attachTrackerServer(httpServer: HttpServer) {
+  const io = new SocketIOServer(httpServer, {
+    cors: { origin: "*" },
+  });
 
   io.on("connection", (socket) => {
-    console.log("Tracker client connected:", socket.id);
+    console.log(`🛰️ Tracker client connected: ${socket.id}`);
 
-    const satellitesPath = path.join(process.cwd(), "data", "satellites.json");
+    const sendSatellitePositions = async () => {
+      try {
+        // Fetch active satellites from MongoDB
+        const satellites = await SatelliteModel.find(
+          { status: "active" },
+          {
+            _id: 1,
+            name: 1,
+            "position.lat": 1,
+            "position.lon": 1,
+            "position.altKm": 1,
+            status: 1,
+          }
+        ).lean();
 
-    const interval = setInterval(() => {
-      const satellites = readArr(satellitesPath)
-        .filter((sat: any) => sat.status === "active")
-        .map((sat: any) => ({
-          id: sat.id,
+        // If you want to simulate motion (optional for demo)
+        const updatedPositions = satellites.map((sat) => ({
+          id: sat._id,
           name: sat.name,
-          lat: sat.lat,
-          lon: sat.lon,
-          altKm: sat.altKm,
+          lat:
+            sat.position?.lat !== undefined
+              ? sat.position.lat + Math.random() * 0.05 - 0.025
+              : 0,
+          lon:
+            sat.position?.lon !== undefined
+              ? sat.position.lon + Math.random() * 0.05 - 0.025
+              : 0,
+          altKm: sat.position?.altKm ?? 400,
           status: sat.status,
         }));
 
-      // debug
-      console.log("Sending positions:", satellites);
+        // Emit the updated positions to the connected client
+        socket.emit("satellite-positions", { positions: updatedPositions });
+      } catch (err) {
+        console.error("❌ Tracker emit error:", err);
+      }
+    };
 
-      socket.emit("satellite-positions", { positions: satellites });
-    }, 1000);
+    // Send every second
+    const interval = setInterval(sendSatellitePositions, 1000);
 
     socket.on("disconnect", () => {
       clearInterval(interval);
-      console.log("Tracker client disconnected:", socket.id);
+      console.log(`🛰️ Tracker client disconnected: ${socket.id}`);
     });
   });
 
-  console.log("Tracker server attached to backend");
+  console.log("✅ Tracker server attached to backend (MongoDB powered)");
   return io;
 }

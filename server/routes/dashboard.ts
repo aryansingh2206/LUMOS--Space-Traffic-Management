@@ -1,63 +1,148 @@
-// routes/dashboard.ts
+// server/routes/dashboard.ts
 import { Router } from "express";
-import fs from "fs";
-import path from "path";
+import { LaunchModel } from "../models/Launch";
+import { SatelliteModel } from "../models/Satellite";
+// If you track collisions/alerts, keep this import. If not, comment it out.
+import { AlertModel } from "../models/Alert";
 
 const router = Router();
 
-const launchesFilePath = path.join(process.cwd(), "data", "launches.json");
-const satellitesFilePath = path.join(process.cwd(), "data", "satellites.json");
+/** Helpers **/
+function isUpcomingByWindowOpen(launch: any, now = Date.now()) {
+  const t = new Date(launch.windowOpen).getTime();
+  return Number.isFinite(t) && t >= now;
+}
+function compareByWindowOpen(a: any, b: any) {
+  return new Date(a.windowOpen).getTime() - new Date(b.windowOpen).getTime();
+}
+function toUtcStr(d: Date | string) {
+  const t = new Date(d);
+  if (!Number.isFinite(+t)) return "";
+  return t.toUTCString();
+}
 
-// Helpers
-function readArr(filePath: string) {
+/** DB → legacy shape (what your current UI expects) */
+function launchToLegacy(l: any) {
+  const open = new Date(l.windowOpen);
+  const yyyy = open.getUTCFullYear();
+  const mm = String(open.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(open.getUTCDate()).padStart(2, "0");
+  const HH = String(open.getUTCHours()).padStart(2, "0");
+  const MM = String(open.getUTCMinutes()).padStart(2, "0");
+
+  return {
+    id: l.id ?? Number(new Date(l.createdAt ?? l.windowOpen).getTime()),
+    name: l.mission,
+    date: `${yyyy}-${mm}-${dd}`,
+    time: `${HH}:${MM}`,
+    launchPad: l.site ?? "",
+    rocketType: l.vehicle ?? "",
+    orbitType: l.orbitType ?? "", // optional, may not exist
+    country: l.agency ?? l.country ?? "",
+    description: l.notes ?? "",
+    status: l.status === "scheduled" ? "Scheduled" : String(l.status ?? ""),
+    createdAt: l.createdAt ?? new Date(),
+    _id: l._id,
+  };
+}
+
+/**
+ * GET /api/dashboard/data
+ * Filter-aware top-line metrics + recent activity
+ * Query: ?country=India&orbitType=LEO&risk=high
+ */
+router.get("/data", async (req, res) => {
   try {
-    if (!fs.existsSync(filePath)) {
-      fs.writeFileSync(filePath, "[]", "utf8");
-      return [];
+    const { country, orbitType, risk } = req.query as {
+      country?: string;
+      orbitType?: string;
+      risk?: "low" | "medium" | "high";
+    };
+
+    // ---- 1) Satellites (this scopes the entire dashboard) ----
+    const satQuery: any = {};
+    if (country) satQuery.country = country;
+    if (orbitType) satQuery.orbitType = orbitType;
+    if (risk) satQuery.riskLevel = risk;
+
+    // We’ll compute everything from the filtered satellites
+    const satellites = await SatelliteModel.find(satQuery).lean();
+
+    const activeSatellites = satellites.filter((s: any) => s.status === "active").length;
+    const highRiskObjects = satellites.filter((s: any) => s.riskLevel === "high").length;
+
+    // basic weekly delta (uses updatedAt if available)
+    const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const highRiskDeltaWeek = satellites.filter(
+      (s: any) => s.riskLevel === "high" && s.updatedAt && new Date(s.updatedAt).getTime() >= weekAgo
+    ).length;
+
+    // ---- 2) Collisions (optional, if you track alerts) ----
+    // If you don't have AlertModel, set both to 0 and keep going.
+    let collisionWarnings = 0;
+    let highRiskCollisionCount = 0;
+    try {
+      if (AlertModel) {
+        // Find collision alerts that involve at least one filtered satellite
+        const satIds = new Set(satellites.map((s: any) => String(s._id ?? s.id)));
+        const alerts = await AlertModel.find({ type: "collision" }).lean();
+
+        const involvingFiltered = alerts.filter((a: any) => {
+          const ids: string[] = (a.satellites ?? a.objects ?? []).map((x: any) => String(x));
+          return ids.some((id) => satIds.has(id));
+        });
+
+        collisionWarnings = involvingFiltered.length;
+        highRiskCollisionCount = involvingFiltered.filter((a: any) => a.riskLevel === "high").length;
+      }
+    } catch {
+      // swallow if model/collection isn't present
+      collisionWarnings = 0;
+      highRiskCollisionCount = 0;
     }
-    const raw = fs.readFileSync(filePath, "utf8");
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error(`Error reading ${filePath}:`, err);
-    return [];
-  }
-}
 
-function writeArr(filePath: string, arr: any[]) {
-  try {
-    fs.writeFileSync(filePath, JSON.stringify(arr, null, 2), "utf8");
-  } catch (err) {
-    console.error(`Error writing ${filePath}:`, err);
-  }
-}
-
-// GET overview data (used by Dashboard.tsx)
-router.get("/data", (_req, res) => {
-  try {
-    const satellites = readArr(satellitesFilePath);
-    const launches = readArr(launchesFilePath);
-
+    // ---- 3) Launches (scope by country/orbit when provided) ----
+    let launches = await LaunchModel.find({}).lean();
     const now = Date.now();
-    const upcomingCount = launches.filter((l: any) => {
-      if (!l.date) return false;
-      const dt = new Date(`${l.date}T${l.time || "00:00"}`).getTime();
-      return !isNaN(dt) && dt >= now;
-    }).length;
 
-    // Example stats (you can extend these)
+    let upcoming = launches.filter((l) => isUpcomingByWindowOpen(l, now));
+    if (country) {
+      // match agency/country/provider fields you store
+      upcoming = upcoming.filter((l: any) => (l.agency ?? l.country ?? "").toString() === country);
+    }
+    if (orbitType) {
+      // only if you store orbitType on the launch
+      upcoming = upcoming.filter((l: any) => (l.orbitType ?? "").toString().toUpperCase() === orbitType.toUpperCase());
+    }
+    upcoming.sort(compareByWindowOpen);
+
+    const upcomingCount = upcoming.length;
+    const next = upcoming[0];
+    const launchChange = next
+      ? `Next: ${next.agency ?? next.country ?? "Launch"} · ${next.vehicle ?? ""} · ${toUtcStr(next.windowOpen)}`
+      : "Next: none";
+
+    // ---- 4) Recent activity (keep it simple for now) ----
+    const recentActivity = [...launches]
+      .sort((a, b) => new Date(b.createdAt ?? 0).getTime() - new Date(a.createdAt ?? 0).getTime())
+      .slice(0, 3)
+      .map((l) => ({
+        message: `Scheduled: ${l.mission}`,
+        timeAgo: "recent",
+        variant: "secondary",
+      }));
+
+    // ---- 5) Response (all 4 cards = filter-aware) ----
     res.json({
-      activeSatellites: satellites.length,
-      collisionWarnings: 23,
+      activeSatellites,
+      activeChange: "+0", // wire to your real daily delta if you track it
+      collisionWarnings,
+      collisionChange: `${highRiskCollisionCount} high-risk`,
       upcomingLaunches: upcomingCount,
-      highRiskObjects: 157,
-      activeChange: "+0",
-      collisionChange: "3 high-risk",
-      launchChange: upcomingCount > 0 ? `Next: ${upcomingCount} scheduled` : "No upcoming",
-      highRiskChange: "+5 this week",
-      recentActivity: [
-        // derive some recent activity if you like - kept simple here
-        ...launches.slice(-3).reverse().map((l: any) => ({ message: `Scheduled: ${l.name}`, timeAgo: "recent", variant: "secondary" })),
-      ],
+      launchChange,
+      highRiskObjects,
+      highRiskChange: `${highRiskDeltaWeek >= 0 ? "+" : ""}${highRiskDeltaWeek} this week`,
+      recentActivity,
     });
   } catch (err) {
     console.error("GET /api/dashboard/data error:", err);
@@ -65,22 +150,19 @@ router.get("/data", (_req, res) => {
   }
 });
 
-// GET filtered upcoming launches for LaunchSchedule.tsx
-router.get("/upcoming-launches", (_req, res) => {
+/**
+ * GET /api/dashboard/upcoming-launches
+ * Return upcoming launches in the **legacy** shape so the Launches page renders.
+ */
+router.get("/upcoming-launches", async (_req, res) => {
   try {
-    const launches = readArr(launchesFilePath);
+    const launches = await LaunchModel.find({}).lean();
     const now = Date.now();
+
     const upcoming = launches
-      .filter((l: any) => {
-        if (!l.date) return false;
-        const dt = new Date(`${l.date}T${l.time || "00:00"}`).getTime();
-        return !isNaN(dt) && dt >= now;
-      })
-      .sort((a: any, b: any) => {
-        const aT = new Date(`${a.date}T${a.time || "00:00"}`).getTime();
-        const bT = new Date(`${b.date}T${b.time || "00:00"}`).getTime();
-        return aT - bT;
-      });
+      .filter((l) => isUpcomingByWindowOpen(l, now))
+      .sort(compareByWindowOpen)
+      .map(launchToLegacy);
 
     res.json(upcoming);
   } catch (err) {
@@ -89,30 +171,36 @@ router.get("/upcoming-launches", (_req, res) => {
   }
 });
 
-// POST mark a scheduled launch as live manually (moves a single launch into satellites.json)
-router.post("/launch-live", (req, res) => {
+/**
+ * POST /api/dashboard/launch-live
+ * Promote a scheduled launch to a satellite.
+ * Body: { id } (accepts Mongo _id or legacy numeric id)
+ */
+router.post("/launch-live", async (req, res) => {
   try {
-    const { id } = req.body;
+    const { id } = req.body || {};
     if (!id) return res.status(400).json({ error: "id is required" });
 
-    const launches = readArr(launchesFilePath);
-    const idx = launches.findIndex((l: any) => l.id === id || String(l.id) === String(id));
-    if (idx === -1) return res.status(404).json({ error: "Launch not found" });
+    // Try by ObjectId first, then fallback to legacy numeric id
+    let launch = await LaunchModel.findById(id);
+    if (!launch && /^\d+$/.test(String(id))) {
+      launch = await LaunchModel.findOne({ id: Number(id) } as any);
+    }
+    if (!launch) return res.status(404).json({ error: "Launch not found" });
 
-    const [launch] = launches.splice(idx, 1);
-    const satellites = readArr(satellitesFilePath);
-    satellites.push({
-      id: Date.now(),
-      name: launch.name,
-      orbitType: launch.orbitType || "LEO",
-      country: launch.country || "",
-      sourceLaunchId: launch.id,
+    await SatelliteModel.create({
+      name: launch.mission,
+      country: launch.agency || launch.country || "",
+      launchedFrom: launch.site || "",
+      rocketType: launch.vehicle || "",
+      sourceLaunchId: launch._id,
       status: "active",
-      liveSince: new Date().toISOString(),
+      liveSince: new Date(),
+      noradId: Math.floor(100000 + Math.random() * 900000),
+      position: { lat: 0, lon: 0, altKm: 400, lastUpdate: new Date() },
     });
 
-    writeArr(launchesFilePath, launches);
-    writeArr(satellitesFilePath, satellites);
+    await LaunchModel.deleteOne({ _id: launch._id });
 
     res.json({ message: "Moved launch to satellites." });
   } catch (err) {
