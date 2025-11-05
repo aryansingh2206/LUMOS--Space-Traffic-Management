@@ -169,6 +169,3 @@ MIT License © 2025 **Aryan**
 > “Every time a satellite dodges another one, a backend engineer silently smiles.”
 
 ---
-
-Would you like me to add **badges** (Render deploy, Node version, license, etc.) and a **demo section with screenshots** or live link placeholders?
-It’ll make the README look super polished for GitHub/portfolio.
